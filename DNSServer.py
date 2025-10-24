@@ -1,4 +1,4 @@
-# DNSimport dns.message
+import dns.message
 import dns.rdatatype
 import dns.rdataclass
 import dns.rdtypes
