@@ -18,6 +18,7 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
+import ast
 
 def generate_aes_key(password, salt):
     kdf = PBKDF2HMAC(
@@ -33,18 +34,24 @@ def generate_aes_key(password, salt):
 def encrypt_with_aes(input_string, password, salt):
     key = generate_aes_key(password, salt)
     f = Fernet(key)
-    encrypted_data = f.encrypt(input_string.encode('utf-8'))
-    return encrypted_data  # bytes
+    encrypted_data = f.encrypt(input_string.encode('utf-8'))  # bytes
+    return encrypted_data
 
 def decrypt_with_aes(encrypted_data, password, salt):
     """
-    Accept either bytes (the normal Fernet token) or a UTF-8 string
-    (e.g. coming from a TXT record). If a string is passed, encode it
-    back to bytes before decrypting.
+    Accepts:
+      - bytes (normal Fernet token), OR
+      - string that is a literal representation of bytes produced by str(bytes),
+        e.g. \"b'...=='\". We convert it back to bytes using ast.literal_eval.
     """
-    # if caller provided a string (from DNS TXT), convert back to bytes
     if isinstance(encrypted_data, str):
-        encrypted_bytes = encrypted_data.encode('utf-8')
+        # expected format is something like: "b'...base64...'"
+        try:
+            # ast.literal_eval will convert "b'...'" -> bytes(...)
+            encrypted_bytes = ast.literal_eval(encrypted_data)
+        except Exception:
+            # Fallback: encode the string directly (not preferred, kept for safety)
+            encrypted_bytes = encrypted_data.encode('utf-8')
     else:
         encrypted_bytes = encrypted_data
 
@@ -53,32 +60,37 @@ def decrypt_with_aes(encrypted_data, password, salt):
     decrypted_data = f.decrypt(encrypted_bytes)
     return decrypted_data.decode('utf-8')
 
-salt = b'Tandon'  # byte object
+# --- configuration / test values ---
+salt = b'Tandon'  # Remember: must be bytes
 password = 'hm3552@nyu.edu'
 input_string = 'AlwaysWatching'
 
-# create an encrypted token (bytes)
+# encrypt (returns bytes)
 encrypted_value = encrypt_with_aes(input_string, password, salt)
-# test decrypt locally (works with bytes)
-decrypted_value = decrypt_with_aes(encrypted_value, password, salt)
+
+# decrypt test (works directly with bytes)
+# decrypted_value = decrypt_with_aes(encrypted_value, password, salt)
+
+# NOTE: store the token as a *string cast* of the bytes (no .decode())
+stored_token_as_string = str(encrypted_value)  # e.g., "b'...=='"
 
 # A dictionary containing DNS records mapping hostnames to different types of DNS data.
 dns_records = {
     'example.com.': {
         dns.rdatatype.A: '192.168.1.101',
         dns.rdatatype.AAAA: '2001:0db8:85a3:0000:0000:8a2e:0370:7334',
-        dns.rdatatype.MX: [(10, 'mail.example.com.')],
+        dns.rdatatype.MX: [(10, 'mail.example.com.')],  # List of (preference, mail server) tuples
         dns.rdatatype.CNAME: 'www.example.com.',
         dns.rdatatype.NS: 'ns.example.com.',
         dns.rdatatype.TXT: ('This is a TXT record',),
         dns.rdatatype.SOA: (
-            'ns1.example.com.', # mname
-            'admin.example.com.', # rname
-            2023081401, # serial
-            3600, # refresh
-            1800, # retry
-            604800, # expire
-            86400, # minimum
+            'ns1.example.com.', #mname
+            'admin.example.com.', #rname
+            2023081401, #serial
+            3600, #refresh
+            1800, #retry
+            604800, #expire
+            86400, #minimum
         ),
     },
     'safebank.com.': {
@@ -93,11 +105,10 @@ dns_records = {
     'yahoo.com.': {
         dns.rdatatype.A: '192.168.1.105',
     },
-    # Store the Fernet token as a UTF-8 string for putting into a TXT record.
-    # Decrypting code will re-encode it back to bytes before decrypting.
+    # Store the token as a string cast of the bytes (no .decode()) as requested
     'nyu.edu.': {
         dns.rdatatype.A: '192.168.1.106',
-        dns.rdatatype.TXT: (encrypted_value.decode('utf-8'),),  # store token as string in TXT
+        dns.rdatatype.TXT: (stored_token_as_string,),  # stored exactly as str(bytes)
         dns.rdatatype.MX: [(10, 'mxa-00256a01.gslb.pphosted.com.')],
         dns.rdatatype.AAAA: '2001:0db8:85a3:0000:0000:8a2e:0373:7312',
         dns.rdatatype.NS: 'ns1.nyu.edu.',
@@ -110,7 +121,7 @@ def run_dns_server():
 
     while True:
         try:
-            data, addr = server_socket.recvfrom(1024)
+            data, addr = server_socket.recvfrom(4096)
             request = dns.message.from_wire(data)
             response = dns.message.make_response(request)
 
@@ -130,15 +141,20 @@ def run_dns_server():
                     rdata = SOA(dns.rdataclass.IN, dns.rdatatype.SOA, mname, rname, serial, refresh, retry, expire, minimum)
                     rdata_list.append(rdata)
                 else:
-                    # For TXT records, dns.rdata.from_text expects the text to be quoted.
                     if qtype == dns.rdatatype.TXT:
-                        # answer_data might be a single string or iterable of strings
+                        # answer_data is a tuple/list of strings. Each string is the stored token string (str(bytes)) or plain text.
                         if isinstance(answer_data, str):
                             txt_items = (answer_data,)
                         else:
                             txt_items = answer_data
+
+                        # Quote and escape double quotes inside the token string so from_text accepts it
+                        def quote_for_txt(s):
+                            s_escaped = s.replace('"', r'\"')
+                            return f'"{s_escaped}"'
+
                         rdata_list = [
-                            dns.rdata.from_text(dns.rdataclass.IN, qtype, f'"{data}"')
+                            dns.rdata.from_text(dns.rdataclass.IN, qtype, quote_for_txt(data))
                             for data in txt_items
                         ]
                     else:
@@ -161,7 +177,7 @@ def run_dns_server():
             server_socket.close()
             sys.exit(0)
         except Exception as e:
-            # Print exception and continue listening (keeps server alive for testing)
+            # keep server running for testing; print exception for debugging
             print("Server error:", repr(e))
 
 def run_dns_server_user():
@@ -182,5 +198,3 @@ def run_dns_server_user():
 
 if __name__ == '__main__':
     run_dns_server_user()
-    #print("Encrypted Value:", encrypted_value)
-    #print("Decrypted Value:", decrypted_value)
